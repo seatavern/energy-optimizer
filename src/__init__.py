@@ -1,0 +1,1 @@
+"""Residential battery optimization prototype."""
