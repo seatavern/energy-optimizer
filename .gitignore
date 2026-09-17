@@ -9,3 +9,5 @@ venv/
 
 .DS_Store
 Thumbs.db
+
+notebooks/battery_optimizer_degradation_test.ipynb
