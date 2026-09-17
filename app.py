@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, Patch, State, ctx, dcc, html, no_update
+from dash import ClientsideFunction, Dash, Input, Output, State, dcc, html
 from plotly.subplots import make_subplots
 
 from src.baseline import add_cumulative_baseline_and_savings, summarize_results
@@ -222,17 +222,77 @@ def empty_figure(title: str, message: str) -> go.Figure:
 
 
 def serialize_result(result: pd.DataFrame) -> dict[str, Any]:
-    """Serialize one solved schedule for reuse by visualization callbacks."""
-    stored_result = result.copy()
-    stored_result["time_start"] = [
-        timestamp.isoformat() for timestamp in PRICE_DATA["time_start"]
+    """Store a compact, precomputed Energy Flow playback payload.
+
+    The full optimizer DataFrame is used once here, then discarded. Timeline
+    movement reads only these frames in the browser.
+    """
+    records: list[dict[str, Any]] = result.to_dict(orient="records")
+    time_starts = PRICE_DATA["time_start"]
+    for index, row in enumerate(records):
+        row["time_start"] = time_starts.iloc[index].isoformat()
+    frames = [
+        _playback_frame(row, records, index) for index, row in enumerate(records)
     ]
-    stored_result["time_end"] = [
-        timestamp.isoformat() for timestamp in PRICE_DATA["time_end"]
-    ]
+    return {"n_steps": len(frames), "frames": frames}
+
+
+def _playback_frame(
+    row: dict[str, Any],
+    records: list[dict[str, Any]],
+    timestep: int,
+) -> dict[str, Any]:
+    """Pack one timestep for clientside playback (numbers + precomputed copy)."""
+    vis = build_flow_visualization(row, records, timestep)
     return {
-        "records": stored_result.to_dict(orient="records"),
-        "n_steps": len(stored_result),
+        "t": row["time_start"],
+        "clock": vis["triangle_time"],
+        "buy": float(row["buy_price"]),
+        "sell": float(row["sell_price"]),
+        "load": vis["load"],
+        "imp": vis["imp"],
+        "exp": vis["exp"],
+        "chg": vis["chg"],
+        "dis": vis["dis"],
+        "soc": vis["soc_percent"],
+        "kwh": vis["kwh"],
+        "triangle_time": vis["triangle_time"],
+        "grid_house_edge_class": vis["grid_house_edge_class"],
+        "house_battery_edge_class": vis["house_battery_edge_class"],
+        "grid_battery_edge_class": vis["grid_battery_edge_class"],
+        "grid_house_label_class": vis["grid_house_label_class"],
+        "house_battery_label_class": vis["house_battery_label_class"],
+        "grid_battery_label_class": vis["grid_battery_label_class"],
+        "grid_house_dir": vis["grid_house_dir"],
+        "grid_house_kw": vis["grid_house_kw"],
+        "house_battery_dir": vis["house_battery_dir"],
+        "house_battery_kw": vis["house_battery_kw"],
+        "grid_battery_dir": vis["grid_battery_dir"],
+        "grid_battery_kw": vis["grid_battery_kw"],
+        "house_load": vis["house_load"],
+        "house_split": vis["house_split"],
+        "house_split_class": vis["house_split_class"],
+        "grid_primary": vis["grid_primary"],
+        "grid_secondary": vis["grid_secondary"],
+        "battery_shell_class": vis["battery_shell_class"],
+        "soc_percent": vis["soc_percent"],
+        "battery_soc": vis["battery_soc"],
+        "battery_energy": vis["battery_energy"],
+        "battery_mode": vis["battery_mode"],
+        "explanation": vis["explanation"],
+        "badge": vis["badge_label"],
+        "badge_cls": vis["badge_class"],
+        "bal_msg": vis["balance_message"],
+        "bal_cls": vis["balance_class"],
+        "m_load": vis["m_load"],
+        "m_buy": vis["m_buy"],
+        "m_sell": vis["m_sell"],
+        "m_imp": vis["m_imp"],
+        "m_exp": vis["m_exp"],
+        "m_chg": vis["m_chg"],
+        "m_dis": vis["m_dis"],
+        "m_soc": vis["m_soc"],
+        "m_kwh": vis["m_kwh"],
     }
 
 
@@ -315,13 +375,6 @@ def _edge_class(direction: str, active: bool) -> str:
 
 def _label_class(active: bool) -> str:
     return "triangle-edge-label " + ("active" if active else "inactive")
-
-
-def _keep_if_same(new_value: str, old_value: str | None) -> str | Any:
-    """Leave a DOM property untouched so CSS animations keep running."""
-    if (old_value or "") == (new_value or ""):
-        return no_update
-    return new_value
 
 
 def static_triangle_edge(
@@ -623,14 +676,33 @@ def describe_current_action(
     )
 
 
-def flow_detail(label: str, value: str) -> html.Div:
-    """Create one compact current-timestep detail."""
+def playback_details_grid() -> html.Div:
+    """Static metric cards; values are patched clientside during playback."""
+    cards = (
+        ("detail-time", "Current time"),
+        ("detail-load", "Household load"),
+        ("detail-buy", "Buy price"),
+        ("detail-sell", "Sell price"),
+        ("detail-import", "Grid import"),
+        ("detail-export", "Grid export"),
+        ("detail-charge", "Battery charge"),
+        ("detail-discharge", "Battery discharge"),
+        ("detail-soc", "Battery SOC"),
+        ("detail-energy", "Battery energy"),
+    )
     return html.Div(
         [
-            html.Div(label, className="flow-detail-label"),
-            html.Div(value, className="flow-detail-value"),
+            html.Div(
+                [
+                    html.Div(label, className="flow-detail-label"),
+                    html.Div("—", id=component_id, className="flow-detail-value"),
+                ],
+                className="flow-detail-card",
+            )
+            for component_id, label in cards
         ],
-        className="flow-detail-card",
+        id="flow-details",
+        className="flow-details-grid",
     )
 
 
@@ -663,28 +735,19 @@ def _now_marker(
 
 
 def build_day_context_figure(
-    records: list[dict[str, Any]],
+    frames: list[dict[str, Any]],
     timestep: int,
 ) -> go.Figure:
     """Build synchronized whole-day panels with a current-time cursor."""
-    timestamps = pd.to_datetime([record["time_start"] for record in records])
-    buy_price = np.asarray([record["buy_price"] for record in records], dtype=float)
-    sell_price = np.asarray([record["sell_price"] for record in records], dtype=float)
-    load_kw = np.asarray([record["load_kw"] for record in records], dtype=float)
-    charge_kw = np.asarray([record["charge_kw"] for record in records], dtype=float)
-    discharge_kw = np.asarray(
-        [record["discharge_kw"] for record in records],
-        dtype=float,
-    )
-    grid_import = np.asarray(
-        [record["grid_import_kw"] for record in records],
-        dtype=float,
-    )
-    grid_export = np.asarray(
-        [record["grid_export_kw"] for record in records],
-        dtype=float,
-    )
-    soc_percent = np.asarray([record["soc"] for record in records], dtype=float) * 100
+    timestamps = pd.to_datetime([frame["t"] for frame in frames])
+    buy_price = np.asarray([frame["buy"] for frame in frames], dtype=float)
+    sell_price = np.asarray([frame["sell"] for frame in frames], dtype=float)
+    load_kw = np.asarray([frame["load"] for frame in frames], dtype=float)
+    charge_kw = np.asarray([frame["chg"] for frame in frames], dtype=float)
+    discharge_kw = np.asarray([frame["dis"] for frame in frames], dtype=float)
+    grid_import = np.asarray([frame["imp"] for frame in frames], dtype=float)
+    grid_export = np.asarray([frame["exp"] for frame in frames], dtype=float)
+    soc_percent = np.asarray([frame["soc"] for frame in frames], dtype=float)
 
     current_time = timestamps[timestep]
     charge_now = float(charge_kw[timestep])
@@ -843,7 +906,7 @@ def build_day_context_figure(
         yref="paper",
         text=current_time.strftime("%H:%M"),
         showarrow=False,
-        xanchor=_cursor_xanchor(timestep, len(records)),
+        xanchor=_cursor_xanchor(timestep, len(frames)),
         font={"color": "#f8fafc", "size": 13, "family": "Arial"},
         bgcolor=COLORS["background"],
         bordercolor=COLORS["blue"],
@@ -885,8 +948,8 @@ def build_day_context_figure(
         col=1,
     )
 
-    tick_indices = sorted({0, 24, 48, 72, len(records) - 1})
-    tick_values = [timestamps[index] for index in tick_indices if index < len(records)]
+    tick_indices = sorted({0, 24, 48, 72, len(frames) - 1})
+    tick_values = [timestamps[index] for index in tick_indices if index < len(frames)]
     tick_text = [timestamp.strftime("%H:%M") for timestamp in tick_values]
     figure.update_xaxes(
         range=[timestamps[0], timestamps[-1]],
@@ -952,43 +1015,6 @@ def _cursor_xanchor(timestep: int, n_steps: int) -> str:
     if timestep >= n_steps - 4:
         return "right"
     return "center"
-
-
-def patch_day_context_cursor(
-    records: list[dict[str, Any]],
-    timestep: int,
-) -> Patch:
-    """Move context markers/cursor without resending the whole-day curves."""
-    row = records[timestep]
-    current_time = row["time_start"]
-    charge = float(row["charge_kw"])
-    discharge = float(row["discharge_kw"])
-    grid_import = float(row["grid_import_kw"])
-    grid_export = float(row["grid_export_kw"])
-    marker_values = {
-        2: (float(row["buy_price"]), True),
-        3: (float(row["sell_price"]), True),
-        9: (float(row["load_kw"]), True),
-        10: (charge, charge > FLOW_TOLERANCE),
-        11: (-discharge, discharge > FLOW_TOLERANCE),
-        12: (grid_import, grid_import > FLOW_TOLERANCE),
-        13: (-grid_export, grid_export > FLOW_TOLERANCE),
-        15: (float(row["soc"]) * 100, True),
-    }
-
-    patched_figure = Patch()
-    for trace_index, (marker_value, visible) in marker_values.items():
-        patched_figure["data"][trace_index]["x"] = [current_time]
-        patched_figure["data"][trace_index]["y"] = [marker_value]
-        patched_figure["data"][trace_index]["opacity"] = 1 if visible else 0
-
-    patched_figure["layout"]["shapes"][0]["x0"] = current_time
-    patched_figure["layout"]["shapes"][0]["x1"] = current_time
-    patched_figure["layout"]["annotations"][3]["x"] = current_time
-    patched_figure["layout"]["annotations"][3]["text"] = pd.to_datetime(
-        current_time
-    ).strftime("%H:%M")
-    return patched_figure
 
 
 def build_flow_visualization(
@@ -1085,19 +1111,6 @@ def build_flow_visualization(
         battery_mode = "Discharging"
         battery_shell_class += " discharging"
 
-    details = [
-        flow_detail("Current time", current_time),
-        flow_detail("Household load", f"{load:.2f} kW"),
-        flow_detail("Buy price", f"{buy_price:.3f} SEK/kWh"),
-        flow_detail("Sell price", f"{sell_price:.3f} SEK/kWh"),
-        flow_detail("Grid import", f"{grid_import:.2f} kW"),
-        flow_detail("Grid export", f"{grid_export:.2f} kW"),
-        flow_detail("Battery charge", f"{charge:.2f} kW"),
-        flow_detail("Battery discharge", f"{discharge:.2f} kW"),
-        flow_detail("Battery SOC", f"{soc_percent:.1f}%"),
-        flow_detail("Battery energy", f"{energy_kwh:.2f} kWh"),
-    ]
-
     explanation = describe_current_action(
         load=load,
         buy_price=buy_price,
@@ -1147,6 +1160,12 @@ def build_flow_visualization(
         balance_class = "flow-balance flow-balance-ok"
 
     return {
+        "load": load,
+        "imp": grid_import,
+        "exp": grid_export,
+        "chg": charge,
+        "dis": discharge,
+        "kwh": energy_kwh,
         "triangle_time": current_time,
         "grid_house_edge_class": _edge_class(
             grid_house_direction, grid_house_value > FLOW_TOLERANCE
@@ -1176,12 +1195,20 @@ def build_flow_visualization(
         "battery_soc": f"{soc_percent:.1f}% SOC",
         "battery_energy": f"{energy_kwh:.2f} kWh",
         "battery_mode": battery_mode or "\u00a0",
-        "details": details,
         "explanation": explanation,
         "badge_label": badge_label,
         "badge_class": badge_class,
         "balance_message": balance_message,
         "balance_class": balance_class,
+        "m_load": f"{load:.2f} kW",
+        "m_buy": f"{buy_price:.3f} SEK/kWh",
+        "m_sell": f"{sell_price:.3f} SEK/kWh",
+        "m_imp": f"{grid_import:.2f} kW",
+        "m_exp": f"{grid_export:.2f} kW",
+        "m_chg": f"{charge:.2f} kW",
+        "m_dis": f"{discharge:.2f} kW",
+        "m_soc": f"{soc_percent:.1f}%",
+        "m_kwh": f"{energy_kwh:.2f} kWh",
     }
 
 
@@ -1332,6 +1359,7 @@ energy_flow_content = html.Div(
                             value=0,
                             marks=timeline_marks,
                             tooltip=None,
+                            updatemode="drag",
                         ),
                     ],
                     className="timeline-panel",
@@ -1391,7 +1419,7 @@ energy_flow_content = html.Div(
             className="flow-balance",
         ),
         html.H3("Current timestep", className="flow-details-heading"),
-        html.Div(id="flow-details", className="flow-details-grid"),
+        playback_details_grid(),
     ],
     className="energy-flow-content",
 )
@@ -1413,7 +1441,6 @@ selected_tab_style = {
 app.layout = html.Div(
     [
         dcc.Store(id="optimization-store"),
-        dcc.Store(id="flow-frame-store"),
         dcc.Store(id="flow-vis-applied"),
         dcc.Interval(id="flow-interval", interval=400, disabled=True),
         html.Div(
@@ -1748,45 +1775,6 @@ def update_dashboard(
 
 
 @app.callback(
-    Output("flow-interval", "disabled"),
-    Output("playback-status", "children"),
-    Input("flow-play", "n_clicks"),
-    Input("flow-pause", "n_clicks"),
-)
-def toggle_playback(
-    play_clicks: int | None,
-    pause_clicks: int | None,
-) -> tuple[bool, str]:
-    """Start or pause timeline playback without recomputing the model."""
-    del play_clicks, pause_clicks
-    if ctx.triggered_id == "flow-play":
-        return False, "Playing"
-    return True, "Paused"
-
-
-@app.callback(
-    Output("flow-timestep", "value"),
-    Input("flow-interval", "n_intervals"),
-    State("flow-timestep", "value"),
-    State("optimization-store", "data"),
-    prevent_initial_call=True,
-)
-def advance_timestep(
-    n_intervals: int,
-    current_timestep: int | None,
-    stored_result: dict[str, Any] | None,
-) -> int | Any:
-    """Advance through the stored result and loop after the final interval."""
-    del n_intervals
-    if not stored_result or not stored_result.get("records"):
-        return no_update
-
-    n_steps = int(stored_result["n_steps"])
-    current = int(current_timestep or 0)
-    return (current + 1) % n_steps
-
-
-@app.callback(
     Output("day-context-chart", "figure"),
     Input("optimization-store", "data"),
     State("flow-timestep", "value"),
@@ -1795,179 +1783,45 @@ def refresh_day_context(
     stored_result: dict[str, Any] | None,
     timestep: int | None,
 ) -> go.Figure:
-    """Rebuild whole-day context only when model inputs produce a new result."""
-    if not stored_result or not stored_result.get("records"):
+    """Rebuild whole-day context only when the optimized schedule changes."""
+    frames = (stored_result or {}).get("frames") if stored_result else None
+    if not frames:
         return empty_figure("Day context", "No optimized schedule is available.")
 
-    records = stored_result["records"]
-    selected_timestep = min(max(int(timestep or 0), 0), len(records) - 1)
-    return build_day_context_figure(records, selected_timestep)
+    selected_timestep = min(max(int(timestep or 0), 0), len(frames) - 1)
+    return build_day_context_figure(frames, selected_timestep)
 
 
-@app.callback(
-    Output("day-context-chart", "figure", allow_duplicate=True),
-    Input("flow-timestep", "value"),
+app.clientside_callback(
+    ClientsideFunction("playback", "toggle_playback"),
+    Output("flow-interval", "disabled"),
+    Output("playback-status", "children"),
+    Input("flow-play", "n_clicks"),
+    Input("flow-pause", "n_clicks"),
+    prevent_initial_call=True,
+)
+app.clientside_callback(
+    ClientsideFunction("playback", "advance_timestep"),
+    Output("flow-timestep", "value"),
+    Input("flow-interval", "n_intervals"),
+    State("flow-timestep", "value"),
     State("optimization-store", "data"),
     prevent_initial_call=True,
 )
-def update_day_context_cursor(
-    timestep: int | None,
-    stored_result: dict[str, Any] | None,
-) -> Patch | Any:
-    """Patch only the current cursor and markers during playback."""
-    if not stored_result or not stored_result.get("records"):
-        return no_update
-
-    records = stored_result["records"]
-    selected_timestep = min(max(int(timestep or 0), 0), len(records) - 1)
-    return patch_day_context_cursor(records, selected_timestep)
-
-
-@app.callback(
+app.clientside_callback(
+    ClientsideFunction("playback", "apply_timestep"),
     Output("flow-visualization", "className"),
     Output("flow-explanation", "children"),
     Output("flow-decision-badge", "children"),
     Output("flow-decision-badge", "className"),
     Output("playback-clock", "children"),
-    Output("flow-details", "children"),
     Output("flow-balance-message", "children"),
     Output("flow-balance-message", "className"),
-    Output("flow-frame-store", "data"),
+    Output("flow-vis-applied", "data"),
     Input("flow-timestep", "value"),
     Input("optimization-store", "data"),
+    Input("dashboard-tabs", "value"),
     State("flow-visualization", "className"),
-)
-def update_energy_flow(
-    timestep: int | None,
-    stored_result: dict[str, Any] | None,
-    visualization_class: str | None,
-) -> tuple[Any, ...]:
-    """Update copy and a triangle frame; the illustration DOM is patched in place."""
-    if not stored_result or not stored_result.get("records"):
-        return (
-            _keep_if_same("is-empty", visualization_class),
-            "No current action is available.",
-            "HOLDING",
-            "decision-badge holding",
-            "—",
-            [],
-            "",
-            "flow-balance flow-balance-ok",
-            None,
-        )
-
-    records = stored_result["records"]
-    selected_timestep = min(max(int(timestep or 0), 0), len(records) - 1)
-    current_time = pd.to_datetime(
-        records[selected_timestep]["time_start"]
-    ).strftime("%H:%M")
-    frame = build_flow_visualization(
-        records[selected_timestep],
-        records,
-        selected_timestep,
-    )
-    triangle_frame = {
-        key: frame[key]
-        for key in (
-            "triangle_time",
-            "grid_house_edge_class",
-            "house_battery_edge_class",
-            "grid_battery_edge_class",
-            "grid_house_label_class",
-            "house_battery_label_class",
-            "grid_battery_label_class",
-            "grid_house_dir",
-            "grid_house_kw",
-            "house_battery_dir",
-            "house_battery_kw",
-            "grid_battery_dir",
-            "grid_battery_kw",
-            "house_load",
-            "house_split",
-            "house_split_class",
-            "grid_primary",
-            "grid_secondary",
-            "battery_shell_class",
-            "soc_percent",
-            "battery_soc",
-            "battery_energy",
-            "battery_mode",
-        )
-    }
-    return (
-        _keep_if_same("", visualization_class),
-        frame["explanation"],
-        frame["badge_label"],
-        frame["badge_class"],
-        current_time,
-        frame["details"],
-        frame["balance_message"],
-        frame["balance_class"],
-        triangle_frame,
-    )
-
-
-app.clientside_callback(
-    """
-    function(frame) {
-        if (!frame) {
-            return window.dash_clientside.no_update;
-        }
-        const setText = (id, value) => {
-            const el = document.getElementById(id);
-            if (!el) {
-                return;
-            }
-            const next = value == null ? "" : String(value);
-            if (el.textContent !== next) {
-                el.textContent = next;
-            }
-        };
-        const setClass = (id, value) => {
-            const el = document.getElementById(id);
-            if (!el || !value || el.className === value) {
-                return;
-            }
-            el.className = value;
-        };
-        const setHeight = (id, pct) => {
-            const el = document.getElementById(id);
-            if (!el) {
-                return;
-            }
-            const next = Number(pct).toFixed(2) + "%";
-            if (el.style.height !== next) {
-                el.style.height = next;
-            }
-        };
-        setText("triangle-time", frame.triangle_time);
-        setClass("triangle-edge-grid-house", frame.grid_house_edge_class);
-        setClass("triangle-edge-house-battery", frame.house_battery_edge_class);
-        setClass("triangle-edge-grid-battery", frame.grid_battery_edge_class);
-        setClass("triangle-label-grid-house", frame.grid_house_label_class);
-        setClass("triangle-label-house-battery", frame.house_battery_label_class);
-        setClass("triangle-label-grid-battery", frame.grid_battery_label_class);
-        setText("triangle-label-grid-house-dir", frame.grid_house_dir);
-        setText("triangle-label-grid-house-kw", frame.grid_house_kw);
-        setText("triangle-label-house-battery-dir", frame.house_battery_dir);
-        setText("triangle-label-house-battery-kw", frame.house_battery_kw);
-        setText("triangle-label-grid-battery-dir", frame.grid_battery_dir);
-        setText("triangle-label-grid-battery-kw", frame.grid_battery_kw);
-        setText("triangle-house-load", frame.house_load);
-        setText("triangle-house-split", frame.house_split);
-        setClass("triangle-house-split", frame.house_split_class);
-        setText("triangle-grid-primary", frame.grid_primary);
-        setText("triangle-grid-secondary", frame.grid_secondary);
-        setClass("battery-shell", frame.battery_shell_class);
-        setHeight("battery-fill", frame.soc_percent);
-        setText("battery-soc", frame.battery_soc);
-        setText("battery-energy", frame.battery_energy);
-        setText("battery-mode", frame.battery_mode);
-        return window.dash_clientside.no_update;
-    }
-    """,
-    Output("flow-vis-applied", "data"),
-    Input("flow-frame-store", "data"),
 )
 
 
