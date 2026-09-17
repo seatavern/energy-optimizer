@@ -15,10 +15,9 @@ The Dash application visualizes the optimized energy flows between the grid, hou
 
 > **Current version:** deterministic 15-minute optimization using known day-ahead prices and a synthetic household load profile.
 
-## Live demo  
-[Open the deployed application]([https://energy-optimizer.thankfulsand-6fed6a90.germanywestcentral.azurecontainerapps.io/](https://energy-optimizer.thankfulsand-6fed6a90.germanywestcentral.azurecontainerapps.io/))
+## Live demo
 
-
+[Open the deployed application](https://energy-optimizer.thankfulsand-6fed6a90.germanywestcentral.azurecontainerapps.io/)
 
 ## Demo
 
