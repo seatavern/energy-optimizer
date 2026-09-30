@@ -15,7 +15,7 @@ The model optimizes battery operation over 15-minute intervals while respecting 
 
 A Dash application visualizes the resulting energy flows between the grid, household, and battery throughout the day and compares the optimized solution with the same household operating without a battery.
 
-Current version: deterministic 15-minute optimization using known day-ahead prices and a synthetic household load profile.
+> **Current version:** deterministic 15-minute optimization using known day-ahead prices and a synthetic household load profile.
 
 ## Live demo
 
